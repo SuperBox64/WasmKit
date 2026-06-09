@@ -208,3 +208,9 @@ Produces a single `local.html` with every asset inlined as a `data:` URL. Opens 
 
 - [superbox64-spritekit](https://github.com/macOS26/superbox64-spritekit) — Swift SpriteKit package that compiles to WASM
 - [Boss-Man](https://github.com/macOS26/Boss-Man) — full arcade game built with this kit, shipping on 6 platforms from one Swift source
+
+---
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Apache 2.0 grants an explicit patent license and terminates it on patent litigation, protecting contributors and users from patent ambush.
