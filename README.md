@@ -17,6 +17,8 @@ The JavaScript runtime in this repo drives the game loop, renders on Canvas2D (d
 | Path | What it is |
 |---|---|
 | `runtime.js` | The entire JavaScript runtime (Canvas2D renderer, Web Audio mixer, DOM input, asset preloader, gamepad, localStorage) |
+| `runtime-embedded.js` | The runtime variant reserved for Embedded Swift builds (same contract; tweaks land here first) |
+| `runtime-embedded-min.js` | Terser-minified embedded runtime (96 KB → 42 KB); what boss-man.us and the WebView apps ship |
 | `shell.html` | Minimal host page — configure `window.WASMWEB`, serve `runtime.js` next to it |
 | `build.sh` | Build helper for C/C++ games via the WASI SDK |
 | `include/abi.h` | C ABI the WASM binary uses to call the runtime (`gfx_*`, `snd_*`, `key_*`, `evt_*`, `win_*`, `store_*`) |
@@ -62,7 +64,7 @@ The WASM binary is a WASI Preview 1 reactor exporting exactly three symbols:
 
 | Export | When called | What it does |
 |---|---|---|
-| `_initialize` | Once, first | libc/libc++ init and C++ global constructors |
+| `_initialize` | Once, first | wasi-libc init and global constructors (works for C, C++ and Embedded Swift reactors alike) |
 | `boot()` | Once, after assets preload | Create the game scene |
 | `frame(dtMs: f64)` | Every `requestAnimationFrame` | Advance and render one frame |
 
@@ -110,6 +112,34 @@ xcrun --toolchain swift swift build \
 The output `.wasm` is served with this runtime exactly like a C++ game.
 
 ---
+
+## Under the Hood
+
+What one frame looks like from the runtime's side:
+
+1. **Instantiate.** `runtime.js` fetches the wasm (WASI Preview 1 or Embedded
+   Swift reactor; both export the same three symbols), provides every `env`
+   import, and calls `_initialize`.
+2. **Preload.** `manifest.json` drives the asset pipeline: images decode to
+   handles, audio decodes to Web Audio buffers, fonts register through
+   `FontFace` (fetched as bytes, so `file://` works too).
+3. **Boot.** `boot()` runs once; the game builds its first scene.
+4. **Loop.** Every `requestAnimationFrame`, gamepads are polled into the
+   event queue, then `frame(dt)` runs. The wasm replies with a stream of
+   `gfx_*` calls the runtime replays onto Canvas2D — sprites and atlas
+   sub-rects via `drawImage`, shapes and text natively, offscreen canvases
+   for bake/crop/effect work, and a hidden WebGL2 canvas for `gfx_shader_*`
+   GLSL effects blitted back into the 2D scene.
+5. **Audio** plays on a Web Audio graph (`snd_*` voices with volume, pan and
+   rate; `eng_*` exposes an AVAudioEngine-shaped player/mixer graph;
+   `tts_*` is the browser's speech synthesis).
+6. **Input** (keyboard, mouse, multi-touch, Web Gamepad) lands in a queue the
+   wasm drains via `evt_poll`; visibility changes pause audio and the loop in
+   background tabs.
+
+There is no Emscripten anywhere in this pipeline, and nothing injected
+between the game and the player: no ads, no watermarks, no logo overlays.
+The wasm and this runtime are the entire stack.
 
 ## ABI Reference (`include/abi.h`)
 
