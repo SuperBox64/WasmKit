@@ -12,6 +12,17 @@ The JavaScript runtime in this repo drives the game loop, renders on Canvas2D (d
 
 ---
 
+## Beyond the browser: cartridges
+
+`cartridge/` is a native console for these games: an Embedded Swift host
+(SDL3 + wasmtime, ~190 KB, no webview) that plays any wasm built on the
+framework like a game cartridge. The same wasm a website serves runs in a
+native window untouched; unknown imports are auto-stubbed from the module's
+import table. See `cartridge/README.md` for the WASM-Cartridge.zip
+distribution model. The sibling SuperBox64 SpriteKit repo adds the third
+permutation: compiling a game straight to a native binary with no wasm at
+all, from the same source.
+
 ## What Is in This Repo
 
 | Path | What it is |
