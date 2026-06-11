@@ -1,4 +1,4 @@
-# superbox64-wasmkit
+# WasmKit
 
 Run a game in the browser as WebAssembly, without Emscripten.
 
@@ -6,7 +6,7 @@ The JavaScript runtime in this repo drives the game loop, renders on Canvas2D (d
 
 **Live demo:** [boss-man.us/play](https://boss-man.us/play)
 
-**Swift SpriteKit package:** [superbox64-spritekit](https://github.com/macOS26/superbox64-spritekit)
+**Swift SpriteKit package:** [SuperBox64Kit](https://github.com/SuperBox64/SuperBox64Kit)
 
 **Reference game:** [Boss-Man](https://github.com/macOS26/Boss-Man)
 
@@ -93,7 +93,7 @@ WASMWEB_OUT=web/game.wasm
 WASMWEB_SRC_DIRS=(src)
 WASMWEB_INCLUDES=(include)
 WASMWEB_SFML=on          # link the sf:: SFML shim
-source ../superbox64-wasmkit/build.sh
+source ../WasmKit/build.sh
 wasmweb_build
 ```
 
@@ -114,7 +114,7 @@ wasmweb_build
 
 ## Building a Swift SpriteKit Game
 
-Use [superbox64-spritekit](https://github.com/macOS26/superbox64-spritekit) as a SwiftPM dependency, then build with the wasm SDK:
+Use [SuperBox64Kit](https://github.com/SuperBox64/SuperBox64Kit) as a SwiftPM dependency, then build with the wasm SDK:
 
 ```bash
 xcrun --toolchain swift swift build \
@@ -249,7 +249,7 @@ Produces a single `local.html` with every asset inlined as a `data:` URL. Opens 
 
 ## Related
 
-- [superbox64-spritekit](https://github.com/macOS26/superbox64-spritekit) — Swift SpriteKit package that compiles to WASM
+- [SuperBox64Kit](https://github.com/SuperBox64/SuperBox64Kit) — Swift SpriteKit package that compiles to WASM
 - [Boss-Man](https://github.com/macOS26/Boss-Man) — full arcade game built with this kit, shipping on 6 platforms from one Swift source
 
 ---
