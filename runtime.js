@@ -120,10 +120,19 @@ const CFG = Object.assign({
   assetRoot: '../assets', // where preloaded assets + manifest.json live
   canvasId: 'game',       // <canvas> element id
   title: null,            // optional document.title
+  cacheBust: '',          // build token; appended as ?v=... to every fetch so a
+                          // rebuilt wasm/asset is never served stale from cache
 }, (typeof window !== 'undefined' && window.WASMWEB) || {});
 
 const LOGICAL_W = CFG.logicalWidth;
 const LOGICAL_H = CFG.logicalHeight;
+
+// Cache-bust suffix appended to wasm + every asset fetch. Browsers cache
+// runtime.js / *.wasm / assets aggressively by filename; without a per-build
+// token a rebuild silently serves the OLD files (the recurring "I fixed it but
+// nothing changed" trap). build.sh stamps CFG.cacheBust with the build time.
+const BUST = CFG.cacheBust ? ('?v=' + encodeURIComponent(CFG.cacheBust)) : '';
+const bust = (url) => url + (BUST && !url.includes('?') ? BUST : '');
 
 // Text-default emoji (Emoji=Yes, Emoji_Presentation=No): Canvas2D renders these
 // as B&W glyphs unless followed by U+FE0F. The game stores some bare (e.g. ⛰
@@ -583,8 +592,9 @@ class Runtime {
         const c = this.ctx2d();
         c.globalAlpha = 1;   // SFML carries alpha in the fill/vertex colour; never inherit a leaked globalAlpha (it washed opaque shape fills out)
         switch (mode) {
-          case 1: c.globalCompositeOperation = 'lighter'; break;
-          case 2: c.globalCompositeOperation = 'multiply'; break;
+          case 1: c.globalCompositeOperation = 'lighter'; break;   // SKBlendMode.add
+          case 2: c.globalCompositeOperation = 'multiply'; break;  // SKBlendMode.multiply
+          case 3: c.globalCompositeOperation = 'screen'; break;    // SKBlendMode.screen (glowing particles, e.g. the white-hole)
           default: c.globalCompositeOperation = 'source-over'; break;
         }
       },
@@ -1865,6 +1875,20 @@ void main() {
     let h = this.imageByName.get(name);
     if (h !== undefined) return h;
     h = this.imageByName.get(this.basename(name));
+    if (h !== undefined) return h;
+    // Case-insensitive fallback. The .sks / particle files reference textures by
+    // their imageset name (e.g. particleTexture "blackHole1") but the converted
+    // asset is named after the lowercased PDF ("blackhole1.svg"), so the
+    // black-hole / mini-game-hole level-end effects resolved to handle 0 and
+    // rendered empty. Build a lowercase index once (preload is done by now) and
+    // retry verbatim + basename.
+    if (!this._imageByNameLC) {
+      this._imageByNameLC = new Map();
+      for (const [k, v] of this.imageByName) this._imageByNameLC.set(k.toLowerCase(), v);
+    }
+    h = this._imageByNameLC.get(String(name).toLowerCase());
+    if (h !== undefined) return h;
+    h = this._imageByNameLC.get(this.basename(name).toLowerCase());
     return h !== undefined ? h : 0;
   }
   lookupSound(name) {
@@ -2134,7 +2158,7 @@ void main() {
     await Promise.all(manifest.fonts.map(async (path) => {
       const family = this.basename(path);
       try {
-        const resp = await fetch(`${ASSET_ROOT}/${path}`);
+        const resp = await fetch(bust(`${ASSET_ROOT}/${path}`));
         const buf = await resp.arrayBuffer();
         const ff = new FontFace(family, buf);
         await ff.load();
@@ -2151,7 +2175,7 @@ void main() {
     // fidelity and never blur on zoom/HiDPI.
     await Promise.all(manifest.images.map(async (path) => {
       try {
-        const resp = await fetch(`${ASSET_ROOT}/${path}`);
+        const resp = await fetch(bust(`${ASSET_ROOT}/${path}`));
         if (/\.svg$/i.test(path)) {
           this.images.push(await this.loadSVG(await resp.text()));
         } else {
@@ -2167,7 +2191,7 @@ void main() {
     const ctx = this.ensureAudio();
     await Promise.all(manifest.sounds.map(async (path) => {
       try {
-        const resp = await fetch(`${ASSET_ROOT}/${path}`);
+        const resp = await fetch(bust(`${ASSET_ROOT}/${path}`));
         const arr = await resp.arrayBuffer();
         const buf = await ctx.decodeAudioData(arr);
         this.sounds.push(buf);
@@ -2181,7 +2205,7 @@ void main() {
     // basename-without-extension so any caller spelling resolves.
     await Promise.all((manifest.texts || ['levels.json']).map(async (path) => {
       try {
-        const resp = await fetch(`${ASSET_ROOT}/${path}`);
+        const resp = await fetch(bust(`${ASSET_ROOT}/${path}`));
         if (!resp.ok) return;
         const s = await resp.text();
         const base = path.split('/').pop();
@@ -2205,7 +2229,7 @@ void main() {
   // manifest.json lives next to this file (web/) and is regenerated from the
   // native assets tree by build-web.sh, so it never goes stale.
   async discoverAssets() {
-    const manifest = await fetch('manifest.json')
+    const manifest = await fetch(bust('manifest.json'))
       .then((r) => (r.ok ? r.json() : null))
       .catch(() => null);
     if (manifest) return manifest;
@@ -2469,9 +2493,9 @@ void main() {
     // (instantiateStreaming hard-requires it; plain instantiate doesn't care).
     let instance;
     try {
-      ({ instance } = await WebAssembly.instantiateStreaming(fetch(url), imports));
+      ({ instance } = await WebAssembly.instantiateStreaming(fetch(bust(url)), imports));
     } catch (_e) {
-      const bytes = await fetch(url).then((r) => r.arrayBuffer());
+      const bytes = await fetch(bust(url)).then((r) => r.arrayBuffer());
       ({ instance } = await WebAssembly.instantiate(bytes, imports));
     }
     this.exports = instance.exports;
