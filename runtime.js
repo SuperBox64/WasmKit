@@ -125,6 +125,39 @@ const CFG = Object.assign({
 const LOGICAL_W = CFG.logicalWidth;
 const LOGICAL_H = CFG.logicalHeight;
 
+// Text-default emoji (Emoji=Yes, Emoji_Presentation=No): Canvas2D renders these
+// as B&W glyphs unless followed by U+FE0F. The game stores some bare (e.g. ⛰
+// U+26F0 renders as a white silhouette). We append FE0F to force colour emoji.
+// Curated to game-relevant symbols; excludes ©®™ and keycap bases so HUD/text
+// is untouched.
+const TEXT_DEFAULT_EMOJI = new Set([
+  0x26F0, // ⛰ mountain
+  0x26FA, // ⛺ tent
+  0x26EA, // ⛪ church
+  0x26F2, // ⛲ fountain
+  0x26F5, // ⛵ boat (usually emoji, harmless)
+  0x2618, // ☘ shamrock
+  0x2600, 0x2601, // ☀ ☁
+  0x2602, // ☂ umbrella
+  0x2614, // ☔
+  0x26C8, // ⛈
+  0x2744, // ❄ snowflake
+  0x2728, // ✨ (emoji default, harmless)
+  0x2604, // ☄ comet
+  0x2702, // ✂ scissors
+  0x2708, // ✈ airplane
+  0x2709, // ✉ envelope
+  0x270F, // ✏ pencil
+  0x2712, // ✒ pen
+  0x2692, 0x2694, 0x2696, 0x2697, 0x2699, // ⚒⚔⚖⚗⚙
+  0x26CF, 0x26D1, 0x26D3, // ⛏⛑⛓
+  0x26E9, // ⛩ shrine
+  0x26F1, // ⛱
+  0x2620, // ☠ skull&crossbones
+  0x2622, 0x2623, // ☢☣
+  0x269C, // ⚜
+]);
+
 // iOS Safari only lets Web Speech run inside a user gesture, so event-driven game
 // voice lines never play reliably. Disable TTS (and its priming) on iOS entirely.
 const IS_IOS = typeof navigator !== 'undefined' &&
@@ -253,6 +286,27 @@ class Runtime {
   u8(ptr, len) { return new Uint8Array(this.wasmMemory.buffer, ptr, len); }
   cstr(ptr, len) { return this.textDecoder.decode(this.u8(ptr, len)); }
 
+  // Force colour emoji on text-default codepoints (append U+FE0F) so e.g. ⛰
+  // doesn't render as a white silhouette. Fast-pathed: only rebuilds the string
+  // when it actually contains a candidate scalar.
+  emojify(s) {
+    if (!s || s.length < 1) return s;
+    let hit = false;
+    for (let i = 0; i < s.length; i++) {
+      const cp = s.codePointAt(i);
+      if (cp > 0xFFFF) i++;
+      if (TEXT_DEFAULT_EMOJI.has(cp)) { hit = true; break; }
+    }
+    if (!hit) return s;
+    const cps = Array.from(s);
+    let out = '';
+    for (let i = 0; i < cps.length; i++) {
+      out += cps[i];
+      if (TEXT_DEFAULT_EMOJI.has(cps[i].codePointAt(0)) && cps[i + 1] !== '️') out += '️';
+    }
+    return out;
+  }
+
   // Debug HUD: live FPS, per-frame image/text draw counts, and wasm frame() ms.
   // Draws straight on the backing canvas in device pixels (identity transform)
   // after the wasm render, so it sits on top of everything.
@@ -276,36 +330,52 @@ class Runtime {
     c.restore();
   }
 
-  // Rasterize a text string into its own offscreen canvas, sized to the glyph's
-  // ink bounds plus a small pad. Returns { canvas, ox, oy } where (ox,oy) is the
-  // offset from the draw pen (x,y) to the canvas top-left, computed so that
-  // drawImage(canvas, x+ox, y+oy) reproduces what fillText(s,x,y) would have
-  // drawn under the given baseline mode (0=alphabetic, 1=middle, 2=top,
-  // 3=bottom). Returns null for empty strings.
-  _rasterizeText(font, s, sizePx, mode, rgba) {
+  // Rasterize a text string into its own offscreen canvas at DEVICE resolution
+  // (logical ink bounds × ds), so blitting it back through the baseScale
+  // transform at logical size stays pixel-crisp on retina/hi-DPR backings — the
+  // prior 1x rasterize-then-upscale was the source of the emoji blur. Returns
+  // { canvas, ox, oy, dw, dh } where (ox,oy) is the LOGICAL offset from the draw
+  // pen (x,y) to where the canvas top-left should land, and (dw,dh) is the
+  // canvas's LOGICAL footprint, so drawImage(canvas, x+ox, y+oy, dw, dh)
+  // reproduces fillText(s,x,y) under the given baseline mode (0=alphabetic,
+  // 1=middle, 2=top, 3=bottom). ds is the device-pixel scale (>=1). Returns
+  // null for empty strings or on any rasterize failure (caller falls back).
+  _rasterizeText(font, s, sizePx, mode, rgba, ds) {
     if (!s) return null;
     const meas = this.ctx2d();
     this.applyFont(meas, font, sizePx, 0);
     const m = meas.measureText(s);
+    // Logical ink metrics (fall back to em-box estimates when the engine omits
+    // the actualBoundingBox* fields, e.g. very old Safari).
     const ascent  = (m.actualBoundingBoxAscent  != null && isFinite(m.actualBoundingBoxAscent))  ? m.actualBoundingBoxAscent  : sizePx * 0.9;
     const descent = (m.actualBoundingBoxDescent != null && isFinite(m.actualBoundingBoxDescent)) ? m.actualBoundingBoxDescent : sizePx * 0.3;
     const left    = (m.actualBoundingBoxLeft    != null && isFinite(m.actualBoundingBoxLeft))    ? m.actualBoundingBoxLeft    : 0;
     const right   = (m.actualBoundingBoxRight   != null && isFinite(m.actualBoundingBoxRight))   ? m.actualBoundingBoxRight   : m.width;
-    const pad = 2;
-    const w = Math.max(1, Math.ceil(left + right) + pad * 2);
-    const h = Math.max(1, Math.ceil(ascent + descent) + pad * 2);
-    const cv = document.createElement('canvas');
-    cv.width = w; cv.height = h;
-    const cc = cv.getContext('2d');
+    const pad = 2;                                   // logical pad around the ink
+    const wL = Math.max(1, Math.ceil(left + right) + pad * 2);   // logical canvas w
+    const hL = Math.max(1, Math.ceil(ascent + descent) + pad * 2); // logical canvas h
+    // Device-pixel canvas size; clamp so a runaway scale can never allocate a
+    // multi-GB bitmap (8192 matches the SVG raster cap).
+    const wD = Math.max(1, Math.min(Math.ceil(wL * ds), 8192));
+    const hD = Math.max(1, Math.min(Math.ceil(hL * ds), 8192));
+    let cv, cc;
+    try {
+      cv = document.createElement('canvas');
+      cv.width = wD; cv.height = hD;
+      cc = cv.getContext('2d');
+      if (!cc) return null;
+    } catch (_e) { return null; }
+    // Draw at device scale: everything below is in logical units, pre-scaled.
+    cc.setTransform(ds, 0, 0, ds, 0, 0);
     this.applyFont(cc, font, sizePx, 0);
     cc.textAlign = 'left';
     cc.textBaseline = 'alphabetic';
     cc.fillStyle = this.css(rgba);
-    const penX = pad + left;      // pen x inside canvas (ink left lands at pad)
-    const penY = pad + ascent;    // alphabetic baseline inside canvas
-    cc.fillText(s, penX, penY);
+    const penX = pad + left;      // logical pen x inside canvas (ink left at pad)
+    const penY = pad + ascent;    // logical alphabetic baseline inside canvas
+    try { cc.fillText(s, penX, penY); } catch (_e) { return null; }
     // baselineY = where the alphabetic baseline sits relative to the draw pen y,
-    // per the same rules the direct gfx_draw_text path uses.
+    // per the same rules the direct gfx_draw_text path uses (logical units).
     let baselineY;
     switch (mode) {
       case 1:  baselineY = (ascent - descent) / 2; break; // middle (visual centre)
@@ -313,7 +383,7 @@ class Runtime {
       case 3:  baselineY = -descent; break;                // bottom
       default: baselineY = 0;                              // alphabetic
     }
-    return { canvas: cv, ox: -left - pad, oy: baselineY - penY };
+    return { canvas: cv, ox: -left - pad, oy: baselineY - penY, dw: wL, dh: hL };
   }
 
   // ==========================================================================
@@ -592,7 +662,7 @@ class Runtime {
       // ---- text ----
       txt_width: (font, ptr, len, sizePx, letterSpacing) => {
         const c = this.ctx2d();
-        const s = this.cstr(ptr, len);
+        const s = this.emojify(this.cstr(ptr, len));
         this.applyFont(c, font, sizePx, letterSpacing);
         let w = c.measureText(s).width;
         if (!this.hasLetterSpacing && letterSpacing) {
@@ -610,12 +680,55 @@ class Runtime {
       gfx_draw_text: (font, ptr, len, x, y, sizePx, rgba, letterSpacing) => {
         this._dcTxt = (this._dcTxt | 0) + 1;
         const c = this.ctx2d();
-        const s = this.cstr(ptr, len);
+        const s = this.emojify(this.cstr(ptr, len));
+        if (!s) return;
         const mode = this._textBaselineMode | 0;
-        // NOTE: glyph caching reverted — rasterizing to a 1x offscreen and
-        // blitting onto the high-DPR backing store upscaled the bitmap and made
-        // emoji/fonts blurry. Direct fillText stays pixel-crisp; the FPS win
-        // comes from viewport culling in the kit instead.
+        // ---- DPR-aware glyph cache -----------------------------------------
+        // Canvas2D color-emoji fillText is the per-frame hot path; an emoji-heavy
+        // scene re-rasterizing every frame collapses to single-digit fps. We
+        // rasterize each (font|size|baseline|rgba|spacing|deviceScale|string)
+        // once into an offscreen canvas AT DEVICE RESOLUTION, then blit it at
+        // LOGICAL size. The live transform here includes the kit's scale(1,-1)
+        // un-flip, so we read the per-axis scale magnitude (flip-safe, same as
+        // drawSVG) to learn how many device pixels one logical unit covers, and
+        // rasterize at that resolution — no upscale, no blur on retina.
+        // Skip the cache only when we'd need the per-char letter-spacing loop
+        // (no native letterSpacing AND a non-zero spacing); that path falls
+        // through to the verbatim direct-fillText code below.
+        const spaced = !this.hasLetterSpacing && !!letterSpacing;
+        if (!spaced) {
+          const m = c.getTransform();
+          // Per-axis device scale (folds in baseScale+DPR+zoom); hypot ignores
+          // the sign of the flip. Quantize to 1/4-px steps so a steady camera
+          // hits the same cache entry every frame, and clamp to a sane ceiling.
+          const sxDev = Math.hypot(m.a, m.b) || 1;
+          const syDev = Math.hypot(m.c, m.d) || 1;
+          const dsRaw = Math.max(sxDev, syDev);
+          const ds = Math.max(1, Math.min(Math.round(dsRaw * 4) / 4, 16));
+          const key = font + '|' + sizePx + '|' + mode + '|' + (rgba >>> 0) +
+                      '|' + (letterSpacing || 0) + '|' + ds + '|' + s;
+          let rec = this._glyphCache.get(key);
+          if (rec !== undefined) {
+            this._glyphCache.delete(key); this._glyphCache.set(key, rec); // LRU bump
+          } else {
+            rec = this._rasterizeText(font, s, sizePx, mode, rgba, ds) || null;
+            this._glyphCache.set(key, rec);
+            // Evict the least-recently-used entries when over the cap.
+            while (this._glyphCache.size > this._glyphCacheCap) {
+              const oldest = this._glyphCache.keys().next().value;
+              this._glyphCache.delete(oldest);
+            }
+          }
+          if (rec) {
+            // Blit at logical size; the live transform scales it back up 1:1 to
+            // the device pixels it was rasterized at, so it stays crisp.
+            try { c.drawImage(rec.canvas, x + rec.ox, y + rec.oy, rec.dw, rec.dh); }
+            catch (_e) { /* zero-size; ignore */ }
+            return;
+          }
+          // rec === null: rasterize failed — fall through to direct fillText.
+        }
+        // ---- direct fillText fallback (per-char spacing or cache miss) ------
         this.applyFont(c, font, sizePx, letterSpacing);
         c.textAlign = 'left';
         c.fillStyle = this.css(rgba);
