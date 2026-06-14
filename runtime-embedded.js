@@ -489,6 +489,16 @@ class Runtime {
         const prevAlpha = c.globalAlpha;
         c.globalAlpha = prevAlpha * a;
         try {
+          // Vector (SVG) textures rasterize on demand at the exact device-pixel
+          // footprint of the destination rect, so they stay crisp at any camera
+          // zoom or devicePixelRatio with zero quality loss. Embedded <image>
+          // bitmaps, <clipPath> and <mask> are rendered by the browser's own
+          // SVG engine, so nothing is flattened. See drawSVG().
+          if (rec.svg) {
+            this.drawSVG(c, rec, sx, sy, sw, sh, dx, dy, dw, dh);
+            c.globalAlpha = prevAlpha;
+            return;
+          }
           // sw or sh < 0 is our "use the full source" sentinel — SKSpriteNode
           // passes -1/-1 when no sub-rect is set, and the 9-arg drawImage
           // throws on negative source dimensions, so we route to the 5-arg
@@ -1656,6 +1666,72 @@ void main() {
     return dot > 0 ? base.slice(0, dot) : base;
   }
 
+  // ==========================================================================
+  // vector (SVG) textures — lossless, resolution-aware
+  // ==========================================================================
+  // Decode an SVG source string into a vector image record. Keeps the live
+  // <img> (the browser's SVG renderer) plus a per-size raster cache. Ensures an
+  // intrinsic width/height (synthesised from viewBox if the <svg> omits them)
+  // so the game's SKTexture.size matches the source art 1:1.
+  async loadSVG(svgText) {
+    let text = svgText, vw = 0, vh = 0;
+    const vb = text.match(/viewBox\s*=\s*["']\s*[-\d.]+\s+[-\d.]+\s+([-\d.]+)\s+([-\d.]+)/);
+    if (vb) { vw = parseFloat(vb[1]); vh = parseFloat(vb[2]); }
+    const hasW = /<svg[^>]*\swidth\s*=/.test(text), hasH = /<svg[^>]*\sheight\s*=/.test(text);
+    if ((!hasW || !hasH) && vw && vh) {
+      text = text.replace(/<svg/, `<svg width="${vw}" height="${vh}"`);
+    }
+    const url = URL.createObjectURL(new Blob([text], { type: 'image/svg+xml' }));
+    const img = new Image();
+    img.src = url;
+    // Image.decode() resolves an SVG <img> in all engines; createImageBitmap on
+    // an SVG blob does NOT (Safari rejects it), which is why we keep the element.
+    try { await img.decode(); }
+    catch (_e) { await new Promise((res) => { img.onload = res; img.onerror = res; }); }
+    img._svgURL = url;   // hold the object URL for the image's lifetime
+    const width = img.naturalWidth || vw || 1, height = img.naturalHeight || vh || 1;
+    return { source: img, width, height, svg: true, _svgCache: new Map() };
+  }
+
+  // Draw an SVG-backed record at the exact device-pixel footprint of the dst
+  // rect (1:1, so no upscaling blur), caching one canvas per size.
+  drawSVG(c, rec, sx, sy, sw, sh, dx, dy, dw, dh) {
+    const m = c.getTransform();
+    const scaleX = Math.hypot(m.a, m.b) || 1;   // baseScale already folds in DPR + zoom
+    const scaleY = Math.hypot(m.c, m.d) || 1;
+    if (sw < 0 || sh < 0) {
+      // Full-source sprite (the common case): rasterize at the dst footprint.
+      const cv = this.svgRaster(rec, Math.ceil(dw * scaleX), Math.ceil(dh * scaleY));
+      c.drawImage(cv, dx, dy, dw, dh);
+    } else {
+      // Sub-rect: rasterize the whole SVG at its footprint scale, then slice.
+      const wDev = Math.ceil(rec.width * scaleX), hDev = Math.ceil(rec.height * scaleY);
+      const cv = this.svgRaster(rec, wDev, hDev);
+      const kx = wDev / rec.width, ky = hDev / rec.height;
+      c.drawImage(cv, sx * kx, sy * ky, sw * kx, sh * ky, dx, dy, dw, dh);
+    }
+  }
+
+  // Rasterize a vector record to a canvas at the given device-pixel size, with a
+  // small per-record LRU cache keyed by size so steady-state draws (a sprite at
+  // a fixed size) cost one cached drawImage after the first frame.
+  svgRaster(rec, wDev, hDev) {
+    wDev = Math.max(1, Math.min(wDev | 0, 8192));
+    hDev = Math.max(1, Math.min(hDev | 0, 8192));
+    const key = wDev + 'x' + hDev;
+    const cache = rec._svgCache;
+    let cv = cache.get(key);
+    if (cv) { cache.delete(key); cache.set(key, cv); return cv; }   // LRU bump
+    cv = document.createElement('canvas');
+    cv.width = wDev; cv.height = hDev;
+    const cc = cv.getContext('2d');
+    cc.imageSmoothingEnabled = true; cc.imageSmoothingQuality = 'high';
+    try { cc.drawImage(rec.source, 0, 0, wDev, hDev); } catch (_e) { /* img not ready */ }
+    cache.set(key, cv);
+    if (cache.size > 8) cache.delete(cache.keys().next().value);    // bound memory
+    return cv;
+  }
+
   // Mirrors bossman-apple's SoundManager.pickBossVoice + bestVoice.
   // Splits voices into NON-female and female pools (matching Apple's
   // gender filter — the Web Speech API doesn't expose v.gender, so we
@@ -1846,13 +1922,19 @@ void main() {
       } catch (e) { console.warn('font load failed', path, e); }
     }));
 
-    // images: ImageBitmap from each png
+    // images: raster (png/jpg/webp) decode to an ImageBitmap; vector (svg) keeps
+    // a live <img> for lossless, resolution-aware rasterization at draw time
+    // (see loadSVG/drawSVG) so embedded images + clip masks render at full
+    // fidelity and never blur on zoom/HiDPI.
     await Promise.all(manifest.images.map(async (path) => {
       try {
         const resp = await fetch(`${ASSET_ROOT}/${path}`);
-        const blob = await resp.blob();
-        const bmp = await createImageBitmap(blob);
-        this.images.push({ source: bmp, width: bmp.width, height: bmp.height });
+        if (/\.svg$/i.test(path)) {
+          this.images.push(await this.loadSVG(await resp.text()));
+        } else {
+          const bmp = await createImageBitmap(await resp.blob());
+          this.images.push({ source: bmp, width: bmp.width, height: bmp.height });
+        }
         const handle = this.images.length - 1;
         this.registerName(this.imageByName, path, this.basename(path), handle);
       } catch (e) { console.warn('image load failed', path, e); }

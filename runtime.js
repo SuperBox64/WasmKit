@@ -208,6 +208,13 @@ class Runtime {
     this.soundByName = new Map();
     this.fontByName = new Map();
     this.texts = new Map();   // text assets (levels.json, ...) for asset_text
+    // Rasterized-glyph cache: maps "font|size|baseline|rgba|string" to a small
+    // offscreen canvas holding the rendered text. Canvas2D color-emoji fillText
+    // is very expensive; an emoji-heavy scene (dozens of SKLabelNode actors)
+    // re-rasterizing every frame collapses to single-digit fps. We rasterize a
+    // string once and blit the bitmap thereafter — same output, ~free redraws.
+    this._glyphCache = new Map();
+    this._glyphCacheCap = 512;
 
     // ---- audio ----
     this.audioCtx = null;
@@ -245,6 +252,69 @@ class Runtime {
   dv() { return new DataView(this.wasmMemory.buffer); }
   u8(ptr, len) { return new Uint8Array(this.wasmMemory.buffer, ptr, len); }
   cstr(ptr, len) { return this.textDecoder.decode(this.u8(ptr, len)); }
+
+  // Debug HUD: live FPS, per-frame image/text draw counts, and wasm frame() ms.
+  // Draws straight on the backing canvas in device pixels (identity transform)
+  // after the wasm render, so it sits on top of everything.
+  drawFpsOverlay() {
+    const c = this.ctx;
+    if (!c) return;
+    const fps = this._fps || 0;
+    const txt = `FPS ${fps.toFixed(0)}  frame ${(this._frameMs||0).toFixed(1)}ms  img ${this._dcImg|0}  txt ${this._dcTxt|0}`;
+    c.save();
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.globalAlpha = 1;
+    c.filter = 'none';
+    c.font = '16px monospace';
+    c.textAlign = 'left';
+    c.textBaseline = 'top';
+    const w = c.measureText(txt).width + 16;
+    c.fillStyle = 'rgba(0,0,0,0.7)';
+    c.fillRect(6, 6, w, 26);
+    c.fillStyle = fps >= 50 ? '#3f6' : fps >= 30 ? '#fd0' : '#f44';
+    c.fillText(txt, 14, 11);
+    c.restore();
+  }
+
+  // Rasterize a text string into its own offscreen canvas, sized to the glyph's
+  // ink bounds plus a small pad. Returns { canvas, ox, oy } where (ox,oy) is the
+  // offset from the draw pen (x,y) to the canvas top-left, computed so that
+  // drawImage(canvas, x+ox, y+oy) reproduces what fillText(s,x,y) would have
+  // drawn under the given baseline mode (0=alphabetic, 1=middle, 2=top,
+  // 3=bottom). Returns null for empty strings.
+  _rasterizeText(font, s, sizePx, mode, rgba) {
+    if (!s) return null;
+    const meas = this.ctx2d();
+    this.applyFont(meas, font, sizePx, 0);
+    const m = meas.measureText(s);
+    const ascent  = (m.actualBoundingBoxAscent  != null && isFinite(m.actualBoundingBoxAscent))  ? m.actualBoundingBoxAscent  : sizePx * 0.9;
+    const descent = (m.actualBoundingBoxDescent != null && isFinite(m.actualBoundingBoxDescent)) ? m.actualBoundingBoxDescent : sizePx * 0.3;
+    const left    = (m.actualBoundingBoxLeft    != null && isFinite(m.actualBoundingBoxLeft))    ? m.actualBoundingBoxLeft    : 0;
+    const right   = (m.actualBoundingBoxRight   != null && isFinite(m.actualBoundingBoxRight))   ? m.actualBoundingBoxRight   : m.width;
+    const pad = 2;
+    const w = Math.max(1, Math.ceil(left + right) + pad * 2);
+    const h = Math.max(1, Math.ceil(ascent + descent) + pad * 2);
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const cc = cv.getContext('2d');
+    this.applyFont(cc, font, sizePx, 0);
+    cc.textAlign = 'left';
+    cc.textBaseline = 'alphabetic';
+    cc.fillStyle = this.css(rgba);
+    const penX = pad + left;      // pen x inside canvas (ink left lands at pad)
+    const penY = pad + ascent;    // alphabetic baseline inside canvas
+    cc.fillText(s, penX, penY);
+    // baselineY = where the alphabetic baseline sits relative to the draw pen y,
+    // per the same rules the direct gfx_draw_text path uses.
+    let baselineY;
+    switch (mode) {
+      case 1:  baselineY = (ascent - descent) / 2; break; // middle (visual centre)
+      case 2:  baselineY = ascent;  break;                 // top
+      case 3:  baselineY = -descent; break;                // bottom
+      default: baselineY = 0;                              // alphabetic
+    }
+    return { canvas: cv, ox: -left - pad, oy: baselineY - penY };
+  }
 
   // ==========================================================================
   // WASI preview1 (only what the binary imports)
@@ -437,6 +507,10 @@ class Runtime {
         c.strokeRect(x, y, w, h);
       },
       gfx_fill_circle: (cx, cy, r, rgba) => {
+        // ctx.arc throws IndexSizeError on a negative/NaN radius (a physics body
+        // whose sprite texture came in undersized can compute a negative radius).
+        // Guard so one bad body can't abort the whole frame.
+        if (!(r > 0) || !isFinite(cx) || !isFinite(cy)) return;
         const c = this.ctx2d();
         c.fillStyle = this.css(rgba);
         c.beginPath();
@@ -444,6 +518,7 @@ class Runtime {
         c.fill();
       },
       gfx_stroke_circle: (cx, cy, r, thickness, rgba) => {
+        if (!(r > 0) || !isFinite(cx) || !isFinite(cy)) return;
         const c = this.ctx2d();
         c.lineWidth = thickness;
         c.strokeStyle = this.css(rgba);
@@ -482,6 +557,7 @@ class Runtime {
 
       // ---- textured quad ----
       gfx_draw_image: (img, sx, sy, sw, sh, dx, dy, dw, dh, rgba) => {
+        this._dcImg = (this._dcImg | 0) + 1;
         const rec = this.images[img];
         if (!rec) return;
         const c = this.ctx2d();
@@ -489,6 +565,16 @@ class Runtime {
         const prevAlpha = c.globalAlpha;
         c.globalAlpha = prevAlpha * a;
         try {
+          // Vector (SVG) textures rasterize on demand at the exact device-pixel
+          // footprint of the destination rect, so they stay crisp at any camera
+          // zoom or devicePixelRatio with zero quality loss. Embedded <image>
+          // bitmaps, <clipPath> and <mask> are rendered by the browser's own
+          // SVG engine, so nothing is flattened. See drawSVG().
+          if (rec.svg) {
+            this.drawSVG(c, rec, sx, sy, sw, sh, dx, dy, dw, dh);
+            c.globalAlpha = prevAlpha;
+            return;
+          }
           // sw or sh < 0 is our "use the full source" sentinel — SKSpriteNode
           // passes -1/-1 when no sub-rect is set, and the 9-arg drawImage
           // throws on negative source dimensions, so we route to the 5-arg
@@ -522,12 +608,17 @@ class Runtime {
         this._textBaselineMode = mode | 0;
       },
       gfx_draw_text: (font, ptr, len, x, y, sizePx, rgba, letterSpacing) => {
+        this._dcTxt = (this._dcTxt | 0) + 1;
         const c = this.ctx2d();
         const s = this.cstr(ptr, len);
+        const mode = this._textBaselineMode | 0;
+        // NOTE: glyph caching reverted — rasterizing to a 1x offscreen and
+        // blitting onto the high-DPR backing store upscaled the bitmap and made
+        // emoji/fonts blurry. Direct fillText stays pixel-crisp; the FPS win
+        // comes from viewport culling in the kit instead.
         this.applyFont(c, font, sizePx, letterSpacing);
         c.textAlign = 'left';
         c.fillStyle = this.css(rgba);
-        const mode = this._textBaselineMode | 0;
         // Visual centring (mode 1): Canvas2D 'middle' uses the em-box
         // geometric centre, but emoji glyphs sit a couple of pixels above
         // the em centre, so they read as too-high. Compute the actual ink
@@ -1656,6 +1747,72 @@ void main() {
     return dot > 0 ? base.slice(0, dot) : base;
   }
 
+  // ==========================================================================
+  // vector (SVG) textures — lossless, resolution-aware
+  // ==========================================================================
+  // Decode an SVG source string into a vector image record. Keeps the live
+  // <img> (the browser's SVG renderer) plus a per-size raster cache. Ensures an
+  // intrinsic width/height (synthesised from viewBox if the <svg> omits them)
+  // so the game's SKTexture.size matches the source art 1:1.
+  async loadSVG(svgText) {
+    let text = svgText, vw = 0, vh = 0;
+    const vb = text.match(/viewBox\s*=\s*["']\s*[-\d.]+\s+[-\d.]+\s+([-\d.]+)\s+([-\d.]+)/);
+    if (vb) { vw = parseFloat(vb[1]); vh = parseFloat(vb[2]); }
+    const hasW = /<svg[^>]*\swidth\s*=/.test(text), hasH = /<svg[^>]*\sheight\s*=/.test(text);
+    if ((!hasW || !hasH) && vw && vh) {
+      text = text.replace(/<svg/, `<svg width="${vw}" height="${vh}"`);
+    }
+    const url = URL.createObjectURL(new Blob([text], { type: 'image/svg+xml' }));
+    const img = new Image();
+    img.src = url;
+    // Image.decode() resolves an SVG <img> in all engines; createImageBitmap on
+    // an SVG blob does NOT (Safari rejects it), which is why we keep the element.
+    try { await img.decode(); }
+    catch (_e) { await new Promise((res) => { img.onload = res; img.onerror = res; }); }
+    img._svgURL = url;   // hold the object URL for the image's lifetime
+    const width = img.naturalWidth || vw || 1, height = img.naturalHeight || vh || 1;
+    return { source: img, width, height, svg: true, _svgCache: new Map() };
+  }
+
+  // Draw an SVG-backed record at the exact device-pixel footprint of the dst
+  // rect (1:1, so no upscaling blur), caching one canvas per size.
+  drawSVG(c, rec, sx, sy, sw, sh, dx, dy, dw, dh) {
+    const m = c.getTransform();
+    const scaleX = Math.hypot(m.a, m.b) || 1;   // baseScale already folds in DPR + zoom
+    const scaleY = Math.hypot(m.c, m.d) || 1;
+    if (sw < 0 || sh < 0) {
+      // Full-source sprite (the common case): rasterize at the dst footprint.
+      const cv = this.svgRaster(rec, Math.ceil(dw * scaleX), Math.ceil(dh * scaleY));
+      c.drawImage(cv, dx, dy, dw, dh);
+    } else {
+      // Sub-rect: rasterize the whole SVG at its footprint scale, then slice.
+      const wDev = Math.ceil(rec.width * scaleX), hDev = Math.ceil(rec.height * scaleY);
+      const cv = this.svgRaster(rec, wDev, hDev);
+      const kx = wDev / rec.width, ky = hDev / rec.height;
+      c.drawImage(cv, sx * kx, sy * ky, sw * kx, sh * ky, dx, dy, dw, dh);
+    }
+  }
+
+  // Rasterize a vector record to a canvas at the given device-pixel size, with a
+  // small per-record LRU cache keyed by size so steady-state draws (a sprite at
+  // a fixed size) cost one cached drawImage after the first frame.
+  svgRaster(rec, wDev, hDev) {
+    wDev = Math.max(1, Math.min(wDev | 0, 8192));
+    hDev = Math.max(1, Math.min(hDev | 0, 8192));
+    const key = wDev + 'x' + hDev;
+    const cache = rec._svgCache;
+    let cv = cache.get(key);
+    if (cv) { cache.delete(key); cache.set(key, cv); return cv; }   // LRU bump
+    cv = document.createElement('canvas');
+    cv.width = wDev; cv.height = hDev;
+    const cc = cv.getContext('2d');
+    cc.imageSmoothingEnabled = true; cc.imageSmoothingQuality = 'high';
+    try { cc.drawImage(rec.source, 0, 0, wDev, hDev); } catch (_e) { /* img not ready */ }
+    cache.set(key, cv);
+    if (cache.size > 8) cache.delete(cache.keys().next().value);    // bound memory
+    return cv;
+  }
+
   // Mirrors bossman-apple's SoundManager.pickBossVoice + bestVoice.
   // Splits voices into NON-female and female pools (matching Apple's
   // gender filter — the Web Speech API doesn't expose v.gender, so we
@@ -1846,13 +2003,19 @@ void main() {
       } catch (e) { console.warn('font load failed', path, e); }
     }));
 
-    // images: ImageBitmap from each png
+    // images: raster (png/jpg/webp) decode to an ImageBitmap; vector (svg) keeps
+    // a live <img> for lossless, resolution-aware rasterization at draw time
+    // (see loadSVG/drawSVG) so embedded images + clip masks render at full
+    // fidelity and never blur on zoom/HiDPI.
     await Promise.all(manifest.images.map(async (path) => {
       try {
         const resp = await fetch(`${ASSET_ROOT}/${path}`);
-        const blob = await resp.blob();
-        const bmp = await createImageBitmap(blob);
-        this.images.push({ source: bmp, width: bmp.width, height: bmp.height });
+        if (/\.svg$/i.test(path)) {
+          this.images.push(await this.loadSVG(await resp.text()));
+        } else {
+          const bmp = await createImageBitmap(await resp.blob());
+          this.images.push({ source: bmp, width: bmp.width, height: bmp.height });
+        }
         const handle = this.images.length - 1;
         this.registerName(this.imageByName, path, this.basename(path), handle);
       } catch (e) { console.warn('image load failed', path, e); }
@@ -2183,13 +2346,20 @@ void main() {
     const loop = (t) => {
       const dt = t - last;
       last = t;
+      // Per-frame draw-call counters (reset here, incremented inside gfx_*).
+      this._dcImg = 0; this._dcTxt = 0;
       try {
         this.pollGamepads();        // emit synthetic key events before the frame
+        const t0 = performance.now();
         this.exports.frame(dt);
+        this._frameMs = performance.now() - t0;
       } catch (err) {
         console.error('frame() threw', err);
         return;   // stop the loop on a fatal trap
       }
+      // Smoothed FPS from real rAF delta + live draw-call / frame-time readout.
+      if (dt > 0) this._fps = this._fps ? this._fps * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
+      if (this._showFpsOverlay !== false) this.drawFpsOverlay();
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
