@@ -1952,9 +1952,10 @@ void main() {
       c.drawImage(cv, dx, dy, dw, dh);
     } else {
       // Sub-rect: rasterize the whole SVG at its footprint scale, then slice.
-      const wDev = Math.ceil(rec.width * scaleX), hDev = Math.ceil(rec.height * scaleY);
-      const cv = this.svgRaster(rec, wDev, hDev);
-      const kx = wDev / rec.width, ky = hDev / rec.height;
+      // svgRaster() may quantize the canvas size, so derive the slice scale from
+      // the ACTUAL returned canvas (cv.width/height), not the requested size.
+      const cv = this.svgRaster(rec, Math.ceil(rec.width * scaleX), Math.ceil(rec.height * scaleY));
+      const kx = cv.width / rec.width, ky = cv.height / rec.height;
       c.drawImage(cv, sx * kx, sy * ky, sw * kx, sh * ky, dx, dy, dw, dh);
     }
   }
@@ -1965,6 +1966,18 @@ void main() {
   svgRaster(rec, wDev, hDev) {
     wDev = Math.max(1, Math.min(wDev | 0, 8192));
     hDev = Math.max(1, Math.min(hDev | 0, 8192));
+    // Quantize the raster to a power-of-two multiple of the SVG's intrinsic size
+    // (aspect preserved via a single multiplier). A continuously-scaling sprite —
+    // e.g. the white-hole particles that grow every frame — would otherwise ask
+    // for a new exact size each frame, miss the cache, and re-rasterize the SVG
+    // EVERY frame for EVERY particle (the 6-fps sink). Rounding the multiplier UP
+    // keeps quality (raster >= display size; the final drawImage downscales).
+    const base = Math.max(rec.width, rec.height) || 1;
+    const need = Math.max(wDev, hDev);
+    let mult = 1;
+    while (base * mult < need && mult < 64) mult *= 2;
+    wDev = Math.max(1, Math.min(Math.round(rec.width  * mult), 8192));
+    hDev = Math.max(1, Math.min(Math.round(rec.height * mult), 8192));
     const key = wDev + 'x' + hDev;
     const cache = rec._svgCache;
     let cv = cache.get(key);
@@ -1975,7 +1988,7 @@ void main() {
     cc.imageSmoothingEnabled = true; cc.imageSmoothingQuality = 'high';
     try { cc.drawImage(rec.source, 0, 0, wDev, hDev); } catch (_e) { /* img not ready */ }
     cache.set(key, cv);
-    if (cache.size > 8) cache.delete(cache.keys().next().value);    // bound memory
+    if (cache.size > 12) cache.delete(cache.keys().next().value);   // bound memory
     return cv;
   }
 
