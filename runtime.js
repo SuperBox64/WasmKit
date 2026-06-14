@@ -240,6 +240,31 @@ class Runtime {
     this.imageByName = new Map();
     this.soundByName = new Map();
     this.fontByName = new Map();
+    // iOS/macOS system fonts the game names by their UIFont family string but
+    // that ship with the OS (NOT bundled as .ttf). SpriteKit resolves these on
+    // device; the browser does too, since Safari/macOS carry the same families.
+    // Pre-register each so SKLabelNode.fontName resolves to the real face — e.g.
+    // the title-screen copyright is "AmericanTypewriter" — instead of falling
+    // through to the monospace default. Key is registered both verbatim and via
+    // basename(), and matching is space-insensitive (see lookupFont).
+    for (const [name, family] of [
+      ['AmericanTypewriter', '"American Typewriter", "AmericanTypewriter", Courier, monospace'],
+      ['Courier',            'Courier, "Courier New", monospace'],
+      ['CourierNew',         '"Courier New", Courier, monospace'],
+      ['Helvetica',          'Helvetica, Arial, sans-serif'],
+      ['HelveticaNeue',      '"Helvetica Neue", Helvetica, Arial, sans-serif'],
+      ['ArialMT',            'Arial, Helvetica, sans-serif'],
+      ['Arial',              'Arial, Helvetica, sans-serif'],
+      ['ChalkboardSE-Regular', '"Chalkboard SE", "Comic Sans MS", cursive'],
+      ['MarkerFelt-Thin',    '"Marker Felt", "Comic Sans MS", cursive'],
+      ['TimesNewRomanPSMT',  '"Times New Roman", Times, serif'],
+      ['Menlo-Regular',      'Menlo, monospace'],
+    ]) {
+      this.fonts.push(family);
+      const h = this.fonts.length - 1;
+      this.fontByName.set(name, h);
+      this.fontByName.set(name.replace(/[\s-]/g, '').toLowerCase(), h);
+    }
     this.texts = new Map();   // text assets (levels.json, ...) for asset_text
     // Rasterized-glyph cache: maps "font|size|baseline|rgba|string" to a small
     // offscreen canvas holding the rendered text. Canvas2D color-emoji fillText
@@ -1852,6 +1877,10 @@ void main() {
     let h = this.fontByName.get(name);
     if (h !== undefined) return h;
     h = this.fontByName.get(this.basename(name));
+    if (h !== undefined) return h;
+    // Space/dash/case-insensitive match so "American Typewriter",
+    // "AmericanTypewriter" and "americantypewriter" all hit the same family.
+    h = this.fontByName.get(String(name).replace(/[\s-]/g, '').toLowerCase());
     return h !== undefined ? h : 0;
   }
   basename(path) {
