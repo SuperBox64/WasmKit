@@ -347,8 +347,16 @@ class Runtime {
   drawFpsOverlay() {
     const c = this.ctx;
     if (!c) return;
+    // Compose the HUD from the SKView flags the kit pushed via dbg_set_overlays:
+    // bit0 = showsFPS, bit1 = showsDrawCount. Nothing on -> draw nothing (Apple
+    // default of showsFPS/showsDrawCount = false).
+    const flags = this._overlayFlags | 0;
+    if (flags === 0) return;
     const fps = this._fps || 0;
-    const txt = `FPS ${fps.toFixed(0)}  frame ${(this._frameMs||0).toFixed(1)}ms  img ${this._dcImg|0}  txt ${this._dcTxt|0}`;
+    const parts = [];
+    if (flags & 1) parts.push(`FPS ${fps.toFixed(0)}  frame ${(this._frameMs||0).toFixed(1)}ms`);
+    if (flags & 2) parts.push(`img ${this._dcImg|0}  txt ${this._dcTxt|0}`);
+    const txt = parts.join('  ');
     c.save();
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.globalAlpha = 1;
@@ -669,6 +677,14 @@ class Runtime {
         const a = (rgba & 0xFF) / 255;
         const prevAlpha = c.globalAlpha;
         c.globalAlpha = prevAlpha * a;
+        // RGB tint (SpriteKit colorBlendFactor / particleColor): when the tint
+        // is not white, multiply the texture's colours by it (masked by the
+        // texture's own alpha) so SKEmitterNode particles take their .sks colour
+        // instead of the raw texture. White (0xFFFFFFxx) means 'no tint' -> the
+        // existing fast paths below. Applies to BOTH raster and SVG textures
+        // (the hit particle 🥛🍞🥚 ships as SVG) so the colour is actually visible.
+        const tr = (rgba >>> 24) & 0xFF, tg = (rgba >>> 16) & 0xFF, tb = (rgba >>> 8) & 0xFF;
+        const tinted = (tr !== 255 || tg !== 255 || tb !== 255);
         try {
           // Vector (SVG) textures rasterize on demand at the exact device-pixel
           // footprint of the destination rect, so they stay crisp at any camera
@@ -676,9 +692,17 @@ class Runtime {
           // bitmaps, <clipPath> and <mask> are rendered by the browser's own
           // SVG engine, so nothing is flattened. See drawSVG().
           if (rec.svg) {
+            if (tinted) {
+              const tcv = this._tintSVG(rec, dw, dh, tr, tg, tb, c);
+              if (tcv) { c.drawImage(tcv, dx, dy, dw, dh); c.globalAlpha = prevAlpha; return; }
+            }
             this.drawSVG(c, rec, sx, sy, sw, sh, dx, dy, dw, dh);
             c.globalAlpha = prevAlpha;
             return;
+          }
+          if (tinted) {
+            const rcv = this._tintRaster(rec, sx, sy, sw, sh, tr, tg, tb);
+            if (rcv) { c.drawImage(rcv, dx, dy, dw, dh); c.globalAlpha = prevAlpha; return; }
           }
           // sw or sh < 0 is our "use the full source" sentinel — SKSpriteNode
           // passes -1/-1 when no sub-rect is set, and the 9-arg drawImage
@@ -1577,6 +1601,10 @@ class Runtime {
       win_set_title: (ptr, len) => { document.title = this.cstr(ptr, len); },
       win_width: () => LOGICAL_W,
       win_height: () => LOGICAL_H,
+
+      // ---- debug HUD (driven by SKView.showsFPS / showsDrawCount) ----
+      // bit0 = showsFPS (FPS + frame ms), bit1 = showsDrawCount (img/txt counts).
+      dbg_set_overlays: (flags) => { this._overlayFlags = flags | 0; },
       win_request_fullscreen: () => {
         // Gate on document.fullscreenEnabled, not el.webkitRequestFullscreen:
         // iPhone Safari defines webkitRequestFullscreen on canvas but it is a
@@ -1867,6 +1895,53 @@ void main() {
     c.font = `${sizePx}px ${family}`;
     if (this.hasLetterSpacing === undefined) this.hasLetterSpacing = 'letterSpacing' in c;
     if (this.hasLetterSpacing) c.letterSpacing = `${letterSpacing || 0}px`;
+  }
+
+  // Multiply a raster image record by an RGB tint, masked by the image's own
+  // alpha, into a small per-record LRU cache. Used by gfx_draw_image to apply
+  // SpriteKit's colorBlendFactor / particleColor tint to raster textures.
+  _tintRaster(rec, sx, sy, sw, sh, tr, tg, tb) {
+    const src = rec.source;
+    const sW = src && (src.naturalWidth || src.width), sH = src && (src.naturalHeight || src.height);
+    if (!sW || !sH) return null;
+    const full = (sw < 0 || sh < 0);
+    const ssx = full ? 0 : sx, ssy = full ? 0 : sy;
+    const w = Math.max(1, Math.ceil(full ? sW : sw)), h = Math.max(1, Math.ceil(full ? sH : sh));
+    const key = 'r,' + ssx + ',' + ssy + ',' + w + ',' + h + ',' + tr + ',' + tg + ',' + tb;
+    return this._tintInto(rec, key, src, ssx, ssy, w, h, tr, tg, tb);
+  }
+
+  // Rasterize an SVG record at the destination footprint (reusing svgRaster's
+  // device-pixel sizing), then multiply by the tint and re-mask by its alpha.
+  // The hit particle texture ships as SVG, so this is the path that colours it.
+  _tintSVG(rec, dw, dh, tr, tg, tb, c) {
+    const m = c.getTransform();
+    const scaleX = Math.hypot(m.a, m.b) || 1, scaleY = Math.hypot(m.c, m.d) || 1;
+    const base = this.svgRaster(rec, Math.ceil(dw * scaleX), Math.ceil(dh * scaleY));
+    if (!base || !base.width || !base.height) return null;
+    const key = 's,' + base.width + 'x' + base.height + ',' + tr + ',' + tg + ',' + tb;
+    return this._tintInto(rec, key, base, 0, 0, base.width, base.height, tr, tg, tb);
+  }
+
+  // Shared multiply+remask into a bounded per-record LRU cache.
+  _tintInto(rec, key, src, ssx, ssy, w, h, tr, tg, tb) {
+    if (!rec._tintCache) rec._tintCache = new Map();
+    let cv = rec._tintCache.get(key);
+    if (cv) { rec._tintCache.delete(key); rec._tintCache.set(key, cv); return cv; }
+    cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const cc = cv.getContext('2d');
+    try {
+      cc.drawImage(src, ssx, ssy, w, h, 0, 0, w, h);
+      cc.globalCompositeOperation = 'multiply';
+      cc.fillStyle = `rgb(${tr},${tg},${tb})`;
+      cc.fillRect(0, 0, w, h);
+      cc.globalCompositeOperation = 'destination-in';
+      cc.drawImage(src, ssx, ssy, w, h, 0, 0, w, h);
+    } catch (_e) { return null; }
+    rec._tintCache.set(key, cv);
+    if (rec._tintCache.size > 16) rec._tintCache.delete(rec._tintCache.keys().next().value);
+    return cv;
   }
 
   // Resolve an asset name to a handle, trying the name verbatim, then with the
@@ -2538,7 +2613,7 @@ void main() {
       }
       // Smoothed FPS from real rAF delta + live draw-call / frame-time readout.
       if (dt > 0) this._fps = this._fps ? this._fps * 0.9 + (1000 / dt) * 0.1 : 1000 / dt;
-      if (this._showFpsOverlay !== false) this.drawFpsOverlay();
+      this.drawFpsOverlay();   // gated internally by the SKView.showsFPS / showsDrawCount flags
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
