@@ -375,6 +375,14 @@ class Runtime {
         console.log('%c[boss] ' + this.cstr(ptr, len), 'color:#e6b800');
       },
 
+      // ---- debug HUD flags (SKView.showsFPS / showsDrawCount) ----
+      // The kit unconditionally pushes the SKView debug flags through this hook
+      // (bit0 = showsFPS, bit1 = showsDrawCount). The full runtime.js renders an
+      // FPS/draw-count HUD from them; the embedded runtime has no HUD renderer,
+      // so it just records the value. The import MUST exist and be callable or
+      // the wasm fails to instantiate (LinkError -> black screen).
+      dbg_set_overlays: (flags) => { this._overlayFlags = flags | 0; },
+
       // ---- target + transform/blend ----
       gfx_target: (target) => {
         this.curTarget = (target > 0 && target < this.targets.length) ? target : 0;
