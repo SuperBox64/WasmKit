@@ -281,7 +281,7 @@ class Runtime {
     // re-rasterizing every frame collapses to single-digit fps. We rasterize a
     // string once and blit the bitmap thereafter — same output, ~free redraws.
     this._glyphCache = new Map();
-    this._glyphCacheCap = 512;
+    this._glyphCacheCap = 2048;   // headroom so an emoji-heavy scene never evicts a still-visible glyph (re-raster = hiccup)
 
     // ---- audio ----
     this.audioCtx = null;
@@ -354,8 +354,9 @@ class Runtime {
     if (flags === 0) return;
     const fps = this._fps || 0;
     const parts = [];
-    if (flags & 1) parts.push(`FPS ${fps.toFixed(0)}  frame ${(this._frameMs||0).toFixed(1)}ms`);
-    if (flags & 2) parts.push(`img ${this._dcImg|0}  txt ${this._dcTxt|0}`);
+    const fm = this._frameMs || 0, mi = this._msImg || 0, mt = this._msTxt || 0;
+    if (flags & 1) parts.push(`FPS ${fps.toFixed(0)}  frame ${fm.toFixed(1)}ms  max ${(this._maxFrameMs||0).toFixed(1)}ms`);
+    if (flags & 2) parts.push(`img ${this._dcImg|0}/${mi.toFixed(1)}ms  txt ${this._dcTxt|0}/${mt.toFixed(1)}ms  rest ${Math.max(0,fm-mi-mt).toFixed(1)}ms`);
     const txt = parts.join('  ');
     c.save();
     c.setTransform(1, 0, 0, 1, 0, 0);
@@ -671,6 +672,7 @@ class Runtime {
       // ---- textured quad ----
       gfx_draw_image: (img, sx, sy, sw, sh, dx, dy, dw, dh, rgba) => {
         this._dcImg = (this._dcImg | 0) + 1;
+        const _t0i = performance.now(); try {   // HUD ms-profile (img time)
         const rec = this.images[img];
         if (!rec) return;
         const c = this.ctx2d();
@@ -716,6 +718,7 @@ class Runtime {
           }
         } catch (_e) { /* zero-size src/dst */ }
         c.globalAlpha = prevAlpha;
+        } finally { this._msImg = (this._msImg || 0) + (performance.now() - _t0i); }
       },
 
       // ---- text ----
@@ -738,6 +741,7 @@ class Runtime {
       },
       gfx_draw_text: (font, ptr, len, x, y, sizePx, rgba, letterSpacing) => {
         this._dcTxt = (this._dcTxt | 0) + 1;
+        const _t0t = performance.now(); try {   // HUD ms-profile (text time)
         const c = this.ctx2d();
         const s = this.emojify(this.cstr(ptr, len));
         if (!s) return;
@@ -826,6 +830,7 @@ class Runtime {
             cx += c.measureText(ch).width + letterSpacing;
           }
         }
+        } finally { this._msTxt = (this._msTxt || 0) + (performance.now() - _t0t); }
       },
 
       // ---- images / fonts / render textures ----
@@ -2602,11 +2607,15 @@ void main() {
       last = t;
       // Per-frame draw-call counters (reset here, incremented inside gfx_*).
       this._dcImg = 0; this._dcTxt = 0;
+      this._msImg = 0; this._msTxt = 0;   // per-frame ms in image/text draws (HUD profile)
       try {
         this.pollGamepads();        // emit synthetic key events before the frame
         const t0 = performance.now();
         this.exports.frame(dt);
         this._frameMs = performance.now() - t0;
+        // Rolling max frame ms (catches hiccups the smoothed FPS hides); decays
+        // so a one-off spike fades over ~1s instead of sticking forever.
+        this._maxFrameMs = Math.max(this._frameMs, (this._maxFrameMs || 0) * 0.97);
       } catch (err) {
         console.error('frame() threw', err);
         return;   // stop the loop on a fatal trap
