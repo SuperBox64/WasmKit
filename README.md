@@ -251,6 +251,7 @@ Produces a single `local.html` with every asset inlined as a `data:` URL. Opens 
 
 - [SuperBox64Kit](https://github.com/SuperBox64/SuperBox64Kit) — Swift SpriteKit package that compiles to WASM
 - [Boss-Man](https://github.com/macOS26/Boss-Man) — full arcade game built with this kit, shipping on 6 platforms from one Swift source
+- [UFO Emoji Arcade](https://github.com/SuperBox64/UFO-Emoji-Arcade) — 5-star App Store SpriteKit game ported to the browser from one Swift source via SuperBox64Kit + this runtime
 
 ---
 

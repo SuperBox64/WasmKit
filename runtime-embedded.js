@@ -355,21 +355,34 @@ class Runtime {
     const fps = this._fps || 0;
     const parts = [];
     const fm = this._frameMs || 0, mi = this._msImg || 0, mt = this._msTxt || 0;
-    if (flags & 1) parts.push(`FPS ${fps.toFixed(0)}  frame ${fm.toFixed(1)}ms  max ${(this._maxFrameMs||0).toFixed(1)}ms`);
+    const avgMs = this._frameSamples ? this._frameSum / this._frameSamples : fm;
+    if (flags & 1) parts.push(`FPS ${fps.toFixed(0)}  frame ${fm.toFixed(1)}  min ${(this._minFrameMs||0).toFixed(1)}  avg ${avgMs.toFixed(1)}  max ${(this._maxFrameMs||0).toFixed(1)}ms`);
     if (flags & 2) parts.push(`img ${this._dcImg|0}/${mi.toFixed(1)}ms  txt ${this._dcTxt|0}/${mt.toFixed(1)}ms  rest ${Math.max(0,fm-mi-mt).toFixed(1)}ms`);
-    const txt = parts.join('  ');
+    // Leak watch: wasm linear memory is monotonic (only grows) — steady climb during
+    // play = Swift-side accumulation (nodes/particles not freed). glyph = JS cache size.
+    if (flags & 2) {
+      const memMB = (this.wasmMemory && this.wasmMemory.buffer) ? (this.wasmMemory.buffer.byteLength / 1048576).toFixed(0) : '?';
+      const imgN = this.images ? (Array.isArray(this.images) ? this.images.filter(Boolean).length : Object.keys(this.images).length) : 0;
+      parts.push(`mem ${memMB}MB  cvs ${((this._canvasBytes||0)/1048576).toFixed(0)}MB  glyph ${this._glyphCache ? this._glyphCache.size : 0}  img# ${imgN}`);
+    }
     c.save();
     c.setTransform(1, 0, 0, 1, 0, 0);
     c.globalAlpha = 1;
     c.filter = 'none';
     c.font = '16px monospace';
-    c.textAlign = 'left';
+    c.textAlign = 'right';      // Apple-style: stacked + right-aligned in the BOTTOM-RIGHT
     c.textBaseline = 'top';
-    const w = c.measureText(txt).width + 16;
+    const lineH = 19, pad = 6;
+    const cw = c.canvas.width, ch = c.canvas.height;
+    let maxW = 0;
+    for (const p of parts) { const pw = c.measureText(p).width; if (pw > maxW) maxW = pw; }
+    const boxW = maxW + 16, boxH = parts.length * lineH + 8;
+    const bx = cw - boxW - pad, by = ch - boxH - pad;
     c.fillStyle = 'rgba(0,0,0,0.7)';
-    c.fillRect(6, 6, w, 26);
+    c.fillRect(bx, by, boxW, boxH);
     c.fillStyle = fps >= 50 ? '#3f6' : fps >= 30 ? '#fd0' : '#f44';
-    c.fillText(txt, 14, 11);
+    const rx = cw - pad - 8;
+    for (let i = 0; i < parts.length; i++) c.fillText(parts[i], rx, by + 4 + i * lineH);
     c.restore();
   }
 
@@ -607,6 +620,13 @@ class Runtime {
           default: c.globalCompositeOperation = 'source-over'; break;
         }
       },
+      // One-shot Apple colorBlendFactor tint for the NEXT gfx_draw_image (set by
+      // SKEmitterNode.draw per particle). Stores the RAW particle colour + bf so
+      // gfx_draw_image can do tex*(1-bf)+colour*bf (source-atop) — correct for
+      // COLOURED emoji textures, unlike the rgba multiply. bf<=0 clears it.
+      gfx_set_tint: (r, g, b, bf) => {
+        this._partTint = bf > 0 ? { r: Math.round(r * 255), g: Math.round(g * 255), b: Math.round(b * 255), bf: Math.min(1, bf) } : null;
+      },
 
       // ---- primitives ----
       gfx_fill_rect: (x, y, w, h, rgba) => {
@@ -673,10 +693,24 @@ class Runtime {
       gfx_draw_image: (img, sx, sy, sw, sh, dx, dy, dw, dh, rgba) => {
         this._dcImg = (this._dcImg | 0) + 1;
         const _t0i = performance.now(); try {   // HUD ms-profile (img time)
+        // Apple colorBlendFactor tint (set by gfx_set_tint immediately before this
+        // call, per particle): consume and clear it FIRST — before the missing-rec
+        // early return below — so a draw whose texture isn't loaded can't strand the
+        // tint and bleed it onto the next frame's background ("whole screen brown").
+        const pt = this._partTint; this._partTint = null;
         const rec = this.images[img];
         if (!rec) return;
         const c = this.ctx2d();
         const a = (rgba & 0xFF) / 255;
+        if (pt) {
+          const blended = this._blendTint(rec, sx, sy, sw, sh, dw, dh, pt, c);
+          if (blended) {
+            const pa = c.globalAlpha; c.globalAlpha = pa * a;
+            try { c.drawImage(blended, dx, dy, dw, dh); } catch (_e) {}
+            c.globalAlpha = pa;
+            return;
+          }
+        }
         const prevAlpha = c.globalAlpha;
         c.globalAlpha = prevAlpha * a;
         // RGB tint (SpriteKit colorBlendFactor / particleColor): when the tint
@@ -1944,8 +1978,13 @@ void main() {
       cc.globalCompositeOperation = 'destination-in';
       cc.drawImage(src, ssx, ssy, w, h, 0, 0, w, h);
     } catch (_e) { return null; }
+    cv._bytes = w * h * 4; this._canvasBytes = (this._canvasBytes || 0) + cv._bytes;
     rec._tintCache.set(key, cv);
-    if (rec._tintCache.size > 16) rec._tintCache.delete(rec._tintCache.keys().next().value);
+    while (rec._tintCache.size > 10) {   // evict + ZERO (Safari frees canvas backing only on resize-to-0)
+      const ek = rec._tintCache.keys().next().value, ev = rec._tintCache.get(ek);
+      if (ev) { this._canvasBytes -= (ev._bytes || 0); ev.width = 0; ev.height = 0; }
+      rec._tintCache.delete(ek);
+    }
     return cv;
   }
 
@@ -2040,6 +2079,58 @@ void main() {
     }
   }
 
+  // Apple SKEmitterNode colorBlendFactor: render the texture at the dest footprint
+  // then source-atop fill the particle colour at globalAlpha=bf -> tex*(1-bf)+colour*bf
+  // masked by the texture's own alpha. Correct for COLOURED emoji textures
+  // (smoke/magic/fire); for a WHITE texture this equals the old multiply so
+  // blackHole/aura are unchanged. Uses ONE reusable scratch canvas (no per-particle
+  // allocation, no Safari canvas leak) — the caller blits it before the next reuse.
+  _blendTint(rec, sx, sy, sw, sh, dw, dh, pt, c) {
+    let base, bw, bh, bsx = 0, bsy = 0;
+    if (rec.svg) {
+      const m = c.getTransform();
+      const scaleX = Math.hypot(m.a, m.b) || 1, scaleY = Math.hypot(m.c, m.d) || 1;
+      base = this.svgRaster(rec, Math.ceil(dw * scaleX), Math.ceil(dh * scaleY));
+      if (!base || !base.width) return null;
+      bw = base.width; bh = base.height;
+    } else {
+      base = rec.source; if (!base) return null;
+      const full = (sw < 0 || sh < 0);
+      bsx = full ? 0 : sx; bsy = full ? 0 : sy;
+      bw = Math.max(1, Math.ceil(full ? (base.naturalWidth || base.width) : sw));
+      bh = Math.max(1, Math.ceil(full ? (base.naturalHeight || base.height) : sh));
+    }
+    // CACHE the tinted canvas per (size, colour, bf) — like the old multiply tint —
+    // so steady/repeated particle draws are a cached blit, not a re-blend + canvas
+    // realloc every frame (the uncached scratch version dropped emoji effects to
+    // <10fps / cvs ballooning). svgRaster already quantises the size and the colour
+    // is quantised to 5 bits, so the key space stays tiny. Zero evicted canvases
+    // (Safari only frees a canvas backing on resize-to-0).
+    if (!rec._blendCache) rec._blendCache = new Map();
+    const key = bw + 'x' + bh + ',' + (pt.r & 0xF8) + ',' + (pt.g & 0xF8) + ',' + (pt.b & 0xF8) + ',' + Math.round(pt.bf * 16);
+    let cv = rec._blendCache.get(key);
+    if (cv && cv.width) { rec._blendCache.delete(key); rec._blendCache.set(key, cv); return cv; }
+    cv = document.createElement('canvas'); cv.width = bw; cv.height = bh;
+    const cc = cv.getContext('2d');
+    try {
+      cc.drawImage(base, bsx, bsy, bw, bh, 0, 0, bw, bh);
+      cc.globalCompositeOperation = 'source-atop';
+      cc.globalAlpha = pt.bf;
+      cc.fillStyle = 'rgb(' + pt.r + ',' + pt.g + ',' + pt.b + ')';
+      cc.fillRect(0, 0, bw, bh);
+    } catch (_e) { return null; }
+    cv._bytes = bw * bh * 4; this._canvasBytes = (this._canvasBytes || 0) + cv._bytes;
+    rec._blendCache.set(key, cv);
+    // Generous bound: a colour-ramp emitter spans ~16-24 quantised colours x a few
+    // svgRaster sizes; too small a cap evicts in-use entries and re-blends them.
+    while (rec._blendCache.size > 64) {
+      const ek = rec._blendCache.keys().next().value, ev = rec._blendCache.get(ek);
+      if (ev) { this._canvasBytes -= (ev._bytes || 0); ev.width = 0; ev.height = 0; }
+      rec._blendCache.delete(ek);
+    }
+    return cv;
+  }
+
   // Rasterize a vector record to a canvas at the given device-pixel size, with a
   // small per-record LRU cache keyed by size so steady-state draws (a sprite at
   // a fixed size) cost one cached drawImage after the first frame.
@@ -2067,8 +2158,17 @@ void main() {
     const cc = cv.getContext('2d');
     cc.imageSmoothingEnabled = true; cc.imageSmoothingQuality = 'high';
     try { cc.drawImage(rec.source, 0, 0, wDev, hDev); } catch (_e) { /* img not ready */ }
+    cv._bytes = wDev * hDev * 4; this._canvasBytes = (this._canvasBytes || 0) + cv._bytes;
     cache.set(key, cv);
-    if (cache.size > 12) cache.delete(cache.keys().next().value);   // bound memory
+    // Evict oldest AND zero its backing. Safari does NOT free a canvas's GPU
+    // memory when the JS reference is dropped (lazy GC) — a churning particle
+    // raster/tint cache balloons to hundreds of MB and Safari force-reloads the
+    // tab. Setting width/height to 0 releases the backing store immediately.
+    while (cache.size > 8) {
+      const ek = cache.keys().next().value, ev = cache.get(ek);
+      if (ev) { this._canvasBytes -= (ev._bytes || 0); ev.width = 0; ev.height = 0; }
+      cache.delete(ek);
+    }
     return cv;
   }
 
@@ -2608,14 +2708,22 @@ void main() {
       // Per-frame draw-call counters (reset here, incremented inside gfx_*).
       this._dcImg = 0; this._dcTxt = 0;
       this._msImg = 0; this._msTxt = 0;   // per-frame ms in image/text draws (HUD profile)
+      this._partTint = null;              // clear any stranded particle tint so it can't bleed onto this frame's first draw
       try {
         this.pollGamepads();        // emit synthetic key events before the frame
         const t0 = performance.now();
         this.exports.frame(dt);
         this._frameMs = performance.now() - t0;
-        // Rolling max frame ms (catches hiccups the smoothed FPS hides); decays
-        // so a one-off spike fades over ~1s instead of sticking forever.
-        this._maxFrameMs = Math.max(this._frameMs, (this._maxFrameMs || 0) * 0.97);
+        // Frame-time stats over the session (after a ~45-frame warmup so the
+        // one-time boot/level-load spike doesn't skew them): min/max are sticky
+        // low/high-water marks; avg is the true running mean over time.
+        this._frameCount = (this._frameCount || 0) + 1;
+        if (this._frameCount > 45) {
+          this._maxFrameMs = Math.max(this._frameMs, this._maxFrameMs || 0);
+          this._minFrameMs = this._minFrameMs == null ? this._frameMs : Math.min(this._frameMs, this._minFrameMs);
+          this._frameSum = (this._frameSum || 0) + this._frameMs;
+          this._frameSamples = (this._frameSamples || 0) + 1;
+        }
       } catch (err) {
         console.error('frame() threw', err);
         return;   // stop the loop on a fatal trap
