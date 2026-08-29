@@ -554,7 +554,7 @@ class Runtime {
   // env imports (platform/web/abi.h)
   // ==========================================================================
   envImports() {
-    return {
+    const env = {
       // C++ exception runtime stubs. With -fno-exceptions on Box2DBridge
       // these shouldn't be reached, but they keep wasm instantiation alive
       // if a stray throw slips in (third-party C++ deps, etc.). __cxa_throw
@@ -1690,7 +1690,53 @@ class Runtime {
         const val = this.cstr(valPtr, vlen);
         try { localStorage.setItem(key, val); } catch (_e) {}
       },
+
+      // Batched single-sprite draw: one wasm->JS crossing replaces the
+      // per-node gfx_save/translate/rotate/scale wrapper + SKSpriteNode's
+      // set_alpha/set_blend/save/scale/draw_image/restore sequence the
+      // native SDL3 backend also collapsed into gfx_draw_sprite (see
+      // SuperBox64Kit native/sdl3-backend.swift, same commit). Mirrors that
+      // composition exactly so rendered output matches. blend is scoped to
+      // this call only (reset after), matching gfx_set_blend's own contract.
+      gfx_draw_sprite: (img, px, py, rotDeg, sx, sy, ax, ay, w, h, alpha, blend, rgba) => {
+        const c = this.ctx2d();
+        c.save();
+        c.translate(px, py);
+        if (rotDeg !== 0) c.rotate(rotDeg * Math.PI / 180);
+        if (sx !== 1 || sy !== 1) c.scale(sx, sy);
+        c.scale(1, -1);                          // SKSpriteNode's y-unflip
+        const savedAlpha = c.globalAlpha;
+        c.globalAlpha = alpha;
+        env.gfx_set_blend(blend);
+        env.gfx_draw_image(img, 0, 0, -1, -1, -w * ax, -h * (1 - ay), w, h, rgba);
+        env.gfx_set_blend(0);
+        c.globalAlpha = savedAlpha;
+        c.restore();
+      },
+
+      // Batched label/emoji draw: one wasm->JS crossing for the per-node
+      // transform + SKLabelNode's set_alpha/save/scale/set_text_baseline/
+      // draw_text/restore sequence. Mirrors gfx_draw_text_xform in
+      // SuperBox64Kit native/sdl3-backend.swift (same commit) so output
+      // matches the native build byte-for-byte.
+      gfx_draw_text_xform: (font, ptr, len, pxw, pyw, rotDeg, sx, sy, localX,
+                            sizePx, baseline, alpha, rgba, spacing) => {
+        const c = this.ctx2d();
+        c.save();
+        c.translate(pxw, pyw);
+        if (rotDeg !== 0) c.rotate(rotDeg * Math.PI / 180);
+        if (sx !== 1 || sy !== 1) c.scale(sx, sy);
+        c.scale(1, -1);                          // text must not be mirrored
+        const savedAlpha = c.globalAlpha;
+        c.globalAlpha = alpha;
+        env.gfx_set_text_baseline(baseline);
+        env.gfx_draw_text(font, ptr, len, localX, 0, sizePx, rgba, spacing);
+        env.gfx_set_text_baseline(2);             // restore default 'top'
+        c.globalAlpha = savedAlpha;
+        c.restore();
+      },
     };
+    return env;
   }
 
   // --------------------------------------------------------------------------

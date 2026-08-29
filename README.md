@@ -107,7 +107,7 @@ The wasm modules WasmKit hosts are produced by [SuperBox64Kit](https://github.co
 | `example/build-test.sh` | Builds the toolchain-proof module to `wasm32-wasi` (reactor) with WASI SDK `clang++ -O2`. |
 | `example/swift-poc/` | Swift + Box2D(C++) proof-of-concept SwiftPM package (`swift-tools-version 6.0`) compiling a Swift reactor to wasm; `web/index.html` symlinks the top-level `runtime.js`. |
 | `cartridge/wasm-cartridge` | Committed arm64 Mach-O executable (~188 KB) + `native-selftest.bmp` — artifacts of the WasmCart native-console cartridge model. |
-| `LICENSE` / `NOTICE` | Apache License 2.0 + NOTICE (Copyright 2026 Todd Bruss). |
+| `LICENSE` / `NOTICE` | Apache License 2.0 + NOTICE (Copyright 2026 Heisenburg). |
 
 > **`runtime-embedded-min.js` is committed generated output. There is no minify script in this repo** — `build.sh` only compiles C/C++ wasm; the Terser minify step lives in a consumer repo. **Do not hand-edit the min file**; regenerate it from the consumer's build. (A past ~334-line hand-fork drift caused a long missing-glyph-cache / white-hole / font symptom-chase.)
 
@@ -372,6 +372,6 @@ On Safari, Chrome 104+, and WebKit-based WebViews the runtime negotiates a `disp
 
 ## Credits & License
 
-**WasmKit, Copyright 2026 Todd Bruss.** This product includes software developed by Todd Bruss.
+**WasmKit, Copyright 2026 Heisenburg.** This product includes software developed by Heisenburg.
 
 Licensed under the **Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Apache 2.0 grants an explicit patent license and terminates it on patent litigation, protecting contributors and users from patent ambush.
