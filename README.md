@@ -375,3 +375,7 @@ On Safari, Chrome 104+, and WebKit-based WebViews the runtime negotiates a `disp
 **WasmKit, Copyright 2026 AgentiLoop.** This product includes software developed by AgentiLoop.
 
 Licensed under the **Apache License 2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Apache 2.0 grants an explicit patent license and terminates it on patent litigation, protecting contributors and users from patent ambush.
+
+---
+
+**AgentiLoop:** [agentiloop.ai](https://agentiloop.ai/)
