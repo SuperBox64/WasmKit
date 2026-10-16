@@ -1,5 +1,8 @@
 # WasmKit
 
+🤖 **Built by the makers of [Agent!](https://github.com/AgentiLoop/Agent)**, an autonomous macOS agent.
+
+
 **The web runtime.** A hand-rolled, no-Emscripten JavaScript host that renders WASI / Embedded-Swift wasm games on Canvas2D and fulfils the KitABI `env` imports in the browser.
 
 Run a game in the browser as WebAssembly, without Emscripten. `runtime.js` drives the game loop, renders on Canvas2D (display-p3 wide color on supporting browsers, plus a hidden WebGL2 canvas for GLSL shader passes), mixes audio on the Web Audio API, handles input from DOM events and the Web Gamepad API, speaks via the Web Speech API, and persists state to `localStorage`. No watermarks. No loading screens. No third-party branding. Nothing injected between the game and the player.
